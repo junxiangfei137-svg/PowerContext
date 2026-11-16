@@ -686,6 +686,42 @@ TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE = Table(
     CheckConstraint("end_offset > start_offset", name="ck_pc_topic_memory_active_chunks_offsets"),
 )
 
+MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH = 128
+
+SOURCE_LIFECYCLE_NODES_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("family", identity_string(16), nullable=False),
+    Column("policy", identity_string(8), nullable=True),
+    Column("parents", _canonical_payload_type(), nullable=False),
+    Column("revision", Integer, nullable=False, server_default="0"),
+    Column("available", Boolean, nullable=False),
+    Column("reference", _canonical_payload_type(), nullable=False),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="RESTRICT"),
+    CheckConstraint(
+        "family IN ('source', 'memory', 'topic')",
+        name="ck_pc_source_lifecycle_nodes_family",
+    ),
+    CheckConstraint(
+        "policy IS NULL OR policy IN ('all', 'any')",
+        name="ck_pc_source_lifecycle_nodes_policy",
+    ),
+)
+
+SOURCE_LIFECYCLE_EVENTS_TABLE = Table(
+    "pc_source_lifecycle_events",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(MAX_SOURCE_LIFECYCLE_NODE_ID_LENGTH), primary_key=True),
+    Column("sequence", BigInteger, nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("reason", _entry_text_type(), nullable=False),
+    ForeignKeyConstraint(("scope_id",), ("pc_scopes.scope_id",), ondelete="RESTRICT"),
+    CheckConstraint("sequence > 0", name="ck_pc_source_lifecycle_events_sequence_positive"),
+)
+
 CONNECTOR_CHECKPOINTS_TABLE = Table(
     "pc_connector_checkpoints",
     SHARED_METADATA,
@@ -918,6 +954,8 @@ SHARED_TABLES = (
     ARTIFACT_PROCESSING_SCHEMA_TABLE,
     ARTIFACT_PROCESSING_MIGRATION_RECEIPTS_TABLE,
     CONNECTOR_CHECKPOINTS_TABLE,
+    SOURCE_LIFECYCLE_NODES_TABLE,
+    SOURCE_LIFECYCLE_EVENTS_TABLE,
     SOURCE_DEFINITION_MANIFESTS_TABLE,
     EXTERNAL_SKILL_REGISTRATIONS_TABLE,
     SKILL_PACKAGES_TABLE,

@@ -101,6 +101,7 @@ from powercontext.builtin.artifacts.skill.distribution import RemoteSkillDistrib
 from powercontext.builtin.artifacts.skill.publication import ManagedSkillPublicationService
 from powercontext.builtin.artifacts.skill.registry import ExternalSkillRegistryService
 from powercontext.builtin.artifacts.topic_memory import (
+    MAX_TOPIC_MEMORY_SEARCH_LIMIT,
     TOPIC_MEMORY_SOURCE_WINDOW_BINDING,
     PublishedTopicMemory,
     TopicMemory,
@@ -152,6 +153,7 @@ from powercontext.builtin.persistence.recurrence import RecurrenceRepository
 from powercontext.builtin.persistence.skill_packages import SkillPackageRepository
 from powercontext.builtin.persistence.skill_publications import SkillPublicationRepository
 from powercontext.builtin.persistence.source_definitions import SourceDefinitionManifestRepository
+from powercontext.builtin.persistence.source_lifecycle import SourceLifecycleRepository
 from powercontext.builtin.persistence.sources import SourceRepository, StoredSource
 from powercontext.builtin.persistence.statistics import StatisticsRepository
 from powercontext.builtin.persistence.supervision import (
@@ -991,16 +993,22 @@ class RelationalContexts:
             embedding_profile = query_embedding.embedding_profile
         scope = validate_scope_id(scope_id)
         async with self.database.transaction() as connection:
-            return await self.repositories.topic_memories.search(
+            eligible = await SourceLifecycleRepository().available_topic_artifacts(connection, scope)
+            result = await self.repositories.topic_memories.search(
                 connection,
                 scope,
                 query,
-                limit=limit,
+                limit=limit if eligible is None else MAX_TOPIC_MEMORY_SEARCH_LIMIT,
                 mode=mode,
                 query_vector=query_vector,
                 embedding_profile=embedding_profile,
                 admission=admission,
             )
+        if eligible is None:
+            return result
+        # Withdrawn Topics stay addressable by exact Revision but never surface in recall.
+        hits = tuple(hit for hit in result.hits if hit.artifact_ref.artifact_id in eligible)[:limit]
+        return result.model_copy(update={"hits": hits})
 
     async def search_skills(
         self,

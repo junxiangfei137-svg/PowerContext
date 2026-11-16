@@ -47,6 +47,7 @@ else:
     from multiprocessing.popen_spawn_posix import Popen as SpawnPopen
 
 from powercontext._logging import log_safely
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import ArtifactProcessingLeadershipLostError
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
@@ -57,7 +58,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingLeaseRepository,
     database_utc_now,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_PROCESSING_INTENTS_TABLE,
+    ARTIFACT_PROCESSING_LEASES_TABLE,
+    SOURCE_JOURNAL_HEADS_TABLE,
+)
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -78,6 +83,7 @@ _CONTROL_CONFLICT_RETRY_SECONDS = 0.1
 _DISCOVERY_PAGE_SIZE = 100
 _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
+_COUNT_TRIGGER_POLL_SECONDS = 0.25
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
@@ -117,6 +123,9 @@ class ArtifactProcessingBinding:
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
+    # Admit one automatic window once at least this many journal identities are pending
+    # beyond the Family cursor, without waiting for a time schedule.
+    automatic_source_threshold: int | None = None
 
     def __post_init__(self) -> None:
         if not self.binding_name or self.binding_name != self.binding_name.strip():
@@ -138,6 +147,10 @@ class ArtifactProcessingBinding:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+        if self.automatic_source_threshold is not None and (
+            type(self.automatic_source_threshold) is not int or self.automatic_source_threshold < 1
+        ):
+            raise ValueError("automatic source threshold must be a positive integer")  # noqa: TRY003
 
 
 class _WorkerResultSender(Protocol):
@@ -462,6 +475,7 @@ class ArtifactProcessingSupervisor:
         self._started = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._renew_task: asyncio.Task[None] | None = None
+        self._count_task: asyncio.Task[None] | None = None
         self._notifications = 0
         self._rotation = 0
         self._lease_lost = False
@@ -508,6 +522,12 @@ class ArtifactProcessingSupervisor:
         if self._task is None:
             self._task = asyncio.create_task(self._run(), name=f"artifact-supervisor-{self._supervisor_group}")
             await self._started.wait()
+        if self._count_task is None and any(
+            state.binding.automatic_source_threshold is not None for state in self._families.values()
+        ):
+            self._count_task = asyncio.create_task(
+                self._run_count_triggers(), name=f"artifact-count-trigger-{self._supervisor_group}"
+            )
 
     def wake(self, binding_name: str | None = None) -> None:
         self._notifications += 1
@@ -519,6 +539,11 @@ class ArtifactProcessingSupervisor:
     async def close(self) -> None:
         self._stop.set()
         self._wake.set()
+        if self._count_task is not None:
+            self._count_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._count_task
+            self._count_task = None
         if self._task is not None:
             self._task.cancel()
             with suppress(asyncio.CancelledError):
@@ -601,6 +626,72 @@ class ArtifactProcessingSupervisor:
             self._log_failure(None, None, error, "lease_renewal")
             self._lease_lost = True
             self._wake.set()
+
+    async def _run_count_triggers(self) -> None:
+        """Request one counted window per Scope without waiting for a time schedule."""
+
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=_COUNT_TRIGGER_POLL_SECONDS)
+                return
+            except TimeoutError:
+                pass
+            try:
+                await self._admit_counted_windows()
+            except asyncio.CancelledError:
+                raise
+            except ArtifactProcessingLeadershipLostError:
+                self._lease_lost = True
+                self._wake.set()
+            except Exception as error:
+                self._log_failure(None, None, error, "count_trigger")
+
+    async def _admit_counted_windows(self) -> None:
+        if self._fence is None:
+            return
+        for state in self._families.values():
+            threshold = state.binding.automatic_source_threshold
+            if threshold is not None:
+                await self._admit_counted_binding(state, threshold)
+
+    async def _admit_counted_binding(self, state: _FamilyState, threshold: int) -> None:
+        binding_name = state.binding.binding_name
+        requested: list[str] = []
+        after = 0
+        while True:
+            async with self._database.transaction() as connection:
+                await self._leases.require_fence(connection, self._require_current_fence())
+                rows = await self._intents.scan(
+                    connection,
+                    binding_name,
+                    after_sequence=after,
+                    limit=_DISCOVERY_PAGE_SIZE,
+                )
+                cursors = SourceCursorRepository()
+                for row in rows:
+                    scope = row.scope_id
+                    if row.requested_generation > row.handled_generation:
+                        continue
+                    if scope in state.running or scope in state.queued or scope in state.retries:
+                        continue
+                    position = await connection.scalar(
+                        select(SOURCE_JOURNAL_HEADS_TABLE.c.position).where(
+                            SOURCE_JOURNAL_HEADS_TABLE.c.scope_id == scope
+                        )
+                    )
+                    if position is None:
+                        continue
+                    cursor = await cursors.load(connection, scope, binding_name)
+                    pending = int(position) - (0 if cursor is None else cursor.cursor.sequence)
+                    if pending < threshold:
+                        continue
+                    await self._intents.request(connection, scope, binding_name)
+                    requested.append(scope)
+                if len(rows) < _DISCOVERY_PAGE_SIZE:
+                    break
+                after = rows[-1].pending_sequence
+        if requested:
+            self.wake(binding_name)
 
     async def _cycle(self) -> None:
         states = tuple(self._families.values())
