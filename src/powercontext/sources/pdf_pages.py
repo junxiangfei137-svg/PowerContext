@@ -20,7 +20,7 @@ import hashlib
 import io
 import math
 import re
-from collections.abc import Iterable
+from collections import Counter
 from urllib.parse import quote
 
 from pydantic import BaseModel
@@ -47,10 +47,204 @@ _STOPWORDS = frozenset(
     some such than that the their theirs them themselves then there these they this those through to too
     under until up very was we were what when where which while who whom why will with would you your
     yours yourself yourselves per also may might must shall upon within without using use used based
+    fy fiscal year years question answer respond response calculate calculated define defined assume
+    assuming perspective analyst investment give relying rely detail details show shown state stated
+    outline outlined directly explicitly else much many according provide provided following
+    company improving improve profile useful metric like explain able reasonably healthy measure
+    historically consistent consistently fluctuating fluctuate roughly relevant represent
     """.split()
 )
-_MAX_QUERY_TERMS = 8
-_CANDIDATE_LIMIT = 200
+_MAX_TERM_QUERIES = 24
+_MAX_EXPANSION_QUERIES = 24
+_MAX_EXPANSION_TERMS = 64
+_CANDIDATE_LIMIT = 1000
+
+_SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
+    (
+        "geography", "geographies", "geographic", "geographical", "region", "regions",
+        "country", "countries", "international", "worldwide", "global", "europe", "asia", "africa",
+    ),
+    (
+        "operate", "operates", "operating", "operation", "operations", "business", "businesses",
+        "segment", "segments",
+    ),
+    (
+        "legal", "litigation", "litigations", "lawsuit", "lawsuits", "proceeding", "proceedings",
+        "claim", "claims", "dispute", "disputes", "regulatory",
+    ),
+    ("battle", "battles", "litigation", "lawsuit", "proceedings", "dispute"),
+    (
+        "restructuring", "restructurings", "impairment", "impairments", "charges", "severance",
+        "productivity",
+    ),
+    ("ebitda", "ebit", "depreciation", "amortization", "amortisation"),
+    ("capex", "capital", "expenditure", "expenditures", "property", "plant", "equipment"),
+    ("revenue", "revenues", "sales", "sale"),
+    ("margin", "margins", "profit", "profits", "earnings"),
+    ("debt", "debts", "borrowings", "borrowing", "notes", "payable"),
+    ("dividend", "dividends"),
+    ("repurchase", "repurchases", "buyback", "buybacks"),
+    ("employee", "employees", "workforce", "headcount", "personnel"),
+    ("competition", "competitive", "competitor", "competitors"),
+    ("risk", "risks", "uncertainties"),
+    ("tax", "taxes", "taxation"),
+    ("lease", "leases", "rental"),
+    ("goodwill", "impairment"),
+    ("pension", "pensions", "retirement"),
+    ("acquisition", "acquisitions", "acquired", "merger", "mergers"),
+    ("inventory", "inventories"),
+    ("receivable", "receivables"),
+    ("payable", "payables"),
+    ("shareholder", "shareholders", "stockholder", "stockholders", "equity"),
+    ("retain", "retains", "retained", "retaining", "retention"),
+    ("customer", "customers", "client", "clients", "consumer", "consumers"),
+    ("cybersecurity", "cyber", "security", "breach"),
+    ("supply", "supplies", "supplier", "suppliers", "logistics", "distribution"),
+    ("climate", "environmental", "emissions", "sustainability", "carbon"),
+)
+_SYNONYM_INDEX: dict[str, tuple[str, ...]] = {}
+for _group in _SYNONYM_GROUPS:
+    for _member in _group:
+        _SYNONYM_INDEX[_member] = tuple(dict.fromkeys((*_SYNONYM_INDEX.get(_member, ()), *_group)))
+
+_ANCHOR_PHRASES: dict[tuple[str, str], tuple[str, ...]] = {
+    ("income", "statement"): ("statement of income", "consolidated statement of income", "statement of operations"),
+    ("statement", "income"): ("statement of income", "consolidated statement of income", "statement of operations"),
+    ("cash", "flow"): ("statement of cash flows", "consolidated statement of cash flows", "cash flows from operating activities"),
+    ("cash", "flows"): ("statement of cash flows", "consolidated statement of cash flows", "cash flows from operating activities"),
+    ("flow", "statement"): ("statement of cash flows", "consolidated statement of cash flows"),
+    ("flows", "statement"): ("statement of cash flows", "consolidated statement of cash flows"),
+    ("balance", "sheet"): ("consolidated balance sheet", "balance sheet"),
+    ("legal", "proceedings"): ("legal proceedings", "item 3 legal proceedings"),
+    ("proceedings", "legal"): ("legal proceedings", "item 3 legal proceedings"),
+    ("legal", "battles"): ("legal proceedings", "litigation", "legal matters"),
+    ("legal", "matters"): ("legal proceedings", "legal matters"),
+    ("legal", "battle"): ("legal proceedings", "litigation"),
+    ("restructuring", "costs"): ("restructuring and impairment", "restructuring charges", "restructuring and impairment charges"),
+    ("restructuring", "charges"): ("restructuring and impairment", "restructuring charges", "restructuring and impairment charges"),
+    ("risk", "factors"): ("risk factors",),
+    ("capital", "expenditures"): ("capital expenditures", "purchases of property plant and equipment"),
+    ("capital", "expenditure"): ("capital expenditures", "purchases of property plant and equipment"),
+    ("property", "plant"): ("property plant and equipment",),
+    ("operating", "income"): ("operating income", "operating profit"),
+    ("gross", "margin"): ("gross margin", "gross profit"),
+    ("net", "income"): ("net income", "net earnings"),
+    ("free", "cash"): ("free cash flow",),
+    ("interest", "expense"): ("interest expense",),
+    ("income", "taxes"): ("income taxes", "effective tax rate"),
+    ("card", "members"): ("card member", "card member retention", "card member spending"),
+    ("card", "member"): ("card member", "card member retention", "card member spending"),
+    ("primary", "customers"): (
+        "commercial airlines",
+        "u.s. government",
+        "government contracts",
+        "limited number of",
+        "portion of our revenue",
+        "portion of our revenues",
+        "of our revenues",
+        "customer accounted for",
+    ),
+    ("customers", "primary"): (
+        "commercial airlines",
+        "u.s. government",
+        "government contracts",
+        "limited number of",
+        "portion of our revenue",
+        "portion of our revenues",
+        "of our revenues",
+        "customer accounted for",
+    ),
+    ("customer", "concentration"): (
+        "customer accounted for",
+        "one customer",
+        "significant customer",
+        "major customer",
+        "of our net revenue",
+        "of our revenue",
+    ),
+    ("customer", "concentrations"): (
+        "customer accounted for",
+        "one customer",
+        "significant customer",
+        "major customer",
+        "of our net revenue",
+        "of our revenue",
+    ),
+    ("quick", "ratio"): ("current assets", "current liabilities", "total current assets", "total current liabilities"),
+}
+_STRONG_ANCHORS = frozenset(
+    {
+        "statement of income",
+        "consolidated statement of income",
+        "statement of operations",
+        "statement of cash flows",
+        "consolidated statement of cash flows",
+        "cash flows from operating activities",
+        "legal proceedings",
+        "item 3 legal proceedings",
+        "restructuring and impairment",
+        "risk factors",
+        "commercial airlines",
+        "u.s. government",
+        "government contracts",
+    }
+)
+
+_STATEMENT_QUERIES = (
+    "consolidated statements of income",
+    "consolidated statement of income",
+    "consolidated statements of operations",
+    "consolidated statements of earnings",
+    "consolidated balance sheets",
+    "consolidated balance sheet",
+    "consolidated statements of cash flows",
+    "consolidated statement of cash flows",
+    "summary of business segment data",
+    "segment information",
+)
+_STATEMENT_HEADINGS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "income",
+        re.compile(r"\b(consolidated )?(statements? of (income|operations|earnings)|statements? of income)\b"),
+    ),
+    ("balance", re.compile(r"\b(consolidated )?balance sheets?\b")),
+    ("cash", re.compile(r"\b(consolidated )?statements? of cash flows?\b")),
+    ("segment", re.compile(r"\b(business segment data|segment (data|information))\b")),
+)
+_KIND_CUES: dict[str, frozenset[str]] = {
+    "income": frozenset(
+        {
+            "income", "revenue", "revenues", "sales", "sale", "margin", "margins", "profit",
+            "profits", "earnings", "cost", "costs", "expense", "expenses", "operating", "operation",
+            "operations",
+        }
+    ),
+    "balance": frozenset(
+        {
+            "liability", "liabilities", "asset", "assets", "liquidity", "ratio", "balance", "sheet",
+            "receivable", "receivables", "inventory", "inventories", "payable", "payables", "debt",
+            "borrowings", "equity", "current",
+        }
+    ),
+    "cash": frozenset(
+        {
+            "cash", "flow", "flows", "dividend", "dividends", "repurchase", "repurchases", "buyback",
+            "buybacks", "capex", "expenditure", "expenditures", "depreciation", "amortization",
+        }
+    ),
+    "segment": frozenset(
+        {
+            "segment", "segments", "product", "products", "service", "services", "category",
+            "categories",
+        }
+    ),
+}
+_METRIC_CUES = frozenset().union(*_KIND_CUES.values()) | frozenset(
+    {
+        "percent", "percentage", "largest", "highest", "lowest", "total", "amount", "compare",
+        "compared", "change", "growth", "increase", "decrease", "return", "turnover", "average",
+    }
+)
 
 
 class PDFDocumentInput(BaseModel):
@@ -183,31 +377,75 @@ PDF_PAGE_SOURCE_DEFINITION = AdapterSourceDefinition(
 
 
 def _query_terms(question: str) -> tuple[str, ...]:
-    terms = [token for token in _TOKEN_RE.findall(question.lower()) if token not in _STOPWORDS]
-    seen: set[str] = set()
-    ordered: list[str] = []
+    terms = [
+        token
+        for token in _TOKEN_RE.findall(question.lower())
+        if len(token) > 1 and token not in _STOPWORDS
+    ]
+    return tuple(dict.fromkeys(terms))
+
+
+def _morph_variants(term: str) -> tuple[str, ...]:
+    if len(term) < 5:
+        return ()
+    variants: list[str] = []
+    if term.endswith("ies"):
+        variants.append(term[:-3] + "y")
+    elif term.endswith("es"):
+        variants.append(term[:-2])
+    elif term.endswith("s"):
+        variants.append(term[:-1])
+    if term.endswith("ing"):
+        variants.extend((term[:-3], term[:-3] + "e"))
+    elif term.endswith("ed"):
+        variants.extend((term[:-2], term[:-1]))
+    return tuple(variant for variant in dict.fromkeys(variants) if len(variant) > 2)
+
+
+def _expansion_terms(terms: tuple[str, ...]) -> tuple[str, ...]:
+    originals = set(terms)
+    expanded: list[str] = []
     for term in terms:
-        if term not in seen:
-            seen.add(term)
-            ordered.append(term)
-    return tuple(ordered)
+        for candidate in (*_SYNONYM_INDEX.get(term, ()), *_morph_variants(term)):
+            if candidate not in originals and candidate not in _STOPWORDS:
+                expanded.append(candidate)
+    return tuple(dict.fromkeys(expanded))[:_MAX_EXPANSION_TERMS]
 
 
-def _search_keywords(terms: Iterable[str]) -> str:
-    return " ".join(terms)
+def _anchor_phrases(terms: tuple[str, ...]) -> tuple[str, ...]:
+    phrases: list[str] = []
+    for left, right in zip(terms, terms[1:]):
+        for pair in ((left, right), (right, left)):
+            phrases.extend(_ANCHOR_PHRASES.get(pair, ()))
+    return tuple(dict.fromkeys(phrases))
 
 
-def _page_tokens(text: str) -> list[str]:
-    return _TOKEN_RE.findall(text.lower())
+def _flat_text(text: str) -> str:
+    body = text.split("\n", 1)[1] if "\n" in text else text
+    return " ".join(_TOKEN_RE.findall(body.lower()))
 
 
-def _match_weight(term: str, counts: dict[str, int]) -> float:
-    if term in counts:
-        return float(counts[term])
+def _contains_phrase(flat: str, phrase: str) -> bool:
+    return f" {phrase} " in f" {flat} "
+
+
+def _bm25(term_frequency: int, length: int, average_length: float, idf: float) -> float:
+    if term_frequency < 1:
+        return 0.0
+    k1 = 1.2
+    b = 0.75
+    norm = k1 * (1.0 - b + b * (length / max(average_length, 1.0)))
+    return idf * (term_frequency * (k1 + 1.0)) / (term_frequency + norm)
+
+
+def _term_frequency(term: str, counts: Counter[str]) -> int:
+    frequency = counts.get(term, 0)
+    if frequency:
+        return frequency
     if len(term) >= 5:
         prefix = term[:5]
-        return float(sum(value for token, value in counts.items() if token.startswith(prefix))) * 0.6
-    return 0.0
+        return sum(value for token, value in counts.items() if token.startswith(prefix))
+    return 0
 
 
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple:
@@ -221,12 +459,21 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple:
     terms = _query_terms(question)
     if not terms:
         terms = tuple(token for token in _TOKEN_RE.findall(question.lower())) or (question.strip().lower(),)
+    expansions = _expansion_terms(terms)
+    anchors = _anchor_phrases(terms)
+    question_kinds = frozenset(
+        kind for kind, cues in _KIND_CUES.items() if any(term in cues for term in terms)
+    )
+    quantitative = question_kinds or any(term in _METRIC_CUES for term in terms)
 
+    queries: list[str] = [" ".join(terms[:_MAX_TERM_QUERIES])]
+    queries.extend(terms[:_MAX_TERM_QUERIES])
+    queries.extend(expansions[:_MAX_EXPANSION_QUERIES])
+    if expansions:
+        queries.append(" ".join(expansions))
+    queries.extend(anchors)
+    queries.extend(_STATEMENT_QUERIES)
     hits: dict[str, object] = {}
-    queries: list[str] = [_search_keywords(terms[:_MAX_QUERY_TERMS])]
-    queries.extend(terms[:5])
-    if len(terms) > 1:
-        queries.append(_search_keywords(terms[:2]))
     seen_queries: set[str] = set()
     for query in queries:
         if not query or query in seen_queries:
@@ -234,42 +481,81 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple:
         seen_queries.add(query)
         page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=_CANDIDATE_LIMIT))
         for hit in page.hits:
-            current = hits.get(hit.entry_id)
-            if current is None or hit.score > current.score:
-                hits[hit.entry_id] = hit
+            hits.setdefault(hit.entry_id, hit)
 
     if not hits:
         return ()
 
-    texts = {entry_id: hit.text.lower() for entry_id, hit in hits.items()}
-    token_counts = {entry_id: _page_tokens(text) for entry_id, text in texts.items()}
-    document_frequency = {term: 0 for term in terms}
-    for entry_id, tokens in token_counts.items():
-        token_set = set(tokens)
-        for term in terms:
-            if term in token_set or (len(term) >= 5 and any(token.startswith(term[:5]) for token in token_set)):
-                document_frequency[term] += 1
+    flats = {entry_id: _flat_text(hit.text) for entry_id, hit in hits.items()}
+    counts = {entry_id: Counter(flat.split()) for entry_id, flat in flats.items()}
+    lengths = {entry_id: len(flat.split()) for entry_id, flat in flats.items()}
+    digits = {
+        entry_id: sum(1 for token in flat.split() if token.isdigit()) for entry_id, flat in flats.items()
+    }
+    kinds = {
+        entry_id: frozenset(
+            kind
+            for kind, pattern in _STATEMENT_HEADINGS
+            if pattern.search(" ".join(flat.split()[:45]))
+        )
+        for entry_id, flat in flats.items()
+    }
+    average_length = sum(lengths.values()) / max(len(hits), 1)
     total = max(len(hits), 1)
+    vocabulary = tuple(dict.fromkeys((*terms, *expansions)))
+    document_frequency = {
+        term: sum(1 for page_counts in counts.values() if term in page_counts) for term in vocabulary
+    }
+    idf = {
+        term: math.log(1.0 + (total - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
+        for term in vocabulary
+    }
+    total_idf = sum(idf[term] for term in terms) or 1.0
 
     def score(entry_id: str) -> float:
-        counts: dict[str, int] = {}
-        for token in token_counts[entry_id]:
-            counts[token] = counts.get(token, 0) + 1
+        page_counts = counts[entry_id]
+        length = lengths[entry_id]
+        flat = flats[entry_id]
         value = 0.0
-        matched = 0
+        matched_idfs: list[float] = []
         for term in terms:
-            weight = _match_weight(term, counts)
-            if not weight:
+            frequency = _term_frequency(term, page_counts)
+            if not frequency:
                 continue
-            matched += 1
-            idf = math.log(1.0 + total / (1.0 + document_frequency[term]))
-            saturation = weight / (weight + 1.2)
-            number_boost = 1.6 if term.isdigit() else 1.0
-            value += idf * saturation * number_boost
-        value += 0.35 * matched / max(len(terms), 1)
-        phrase = _search_keywords(terms[:3])
-        if phrase and phrase in texts[entry_id]:
-            value += 0.5
+            matched_idfs.append(idf[term])
+            value += _bm25(frequency, length, average_length, idf[term])
+        coverage = sum(matched_idfs) / total_idf
+        value += 4.0 * coverage
+        matched_idfs.sort(reverse=True)
+        value += 1.2 * sum(matched_idfs[:2])
+        expansion_value = 0.0
+        for term in expansions:
+            frequency = _term_frequency(term, page_counts)
+            if frequency:
+                expansion_value += _bm25(frequency, length, average_length, idf[term])
+        value += min(2.0, 0.25 * expansion_value)
+        pair_hits = sum(
+            1
+            for left, right in zip(terms, terms[1:])
+            if _contains_phrase(flat, f"{left} {right}") or _contains_phrase(flat, f"{right} {left}")
+        )
+        value += min(3.0, 1.5 * pair_hits)
+        anchor_hits = [phrase for phrase in anchors if _contains_phrase(flat, phrase)]
+        value += sum(6.0 if phrase in _STRONG_ANCHORS else 4.0 for phrase in anchor_hits)
+        heading = " ".join(flat.split()[:18])
+        if any(_contains_phrase(heading, phrase) for phrase in anchors):
+            value += 1.0
+        page_kinds = kinds[entry_id]
+        if page_kinds:
+            value += 2.0
+            if question_kinds and page_kinds & question_kinds:
+                value += 13.0
+        if quantitative:
+            digit_share = digits[entry_id] / max(length, 1)
+            if digit_share >= 0.25:
+                value += 3.0
+            elif digit_share >= 0.15:
+                value += 1.5
         return value
 
     ranked = sorted(
